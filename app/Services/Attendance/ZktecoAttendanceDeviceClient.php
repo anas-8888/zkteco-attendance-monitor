@@ -6,13 +6,17 @@ use App\Services\Attendance\Contracts\AttendanceDeviceClient;
 use App\Services\Attendance\DTO\AttendanceRecord;
 use App\Services\Attendance\DTO\DeviceStatus;
 use App\Services\Attendance\Exceptions\DeviceConnectionException;
-use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Log;
 use Mithun\PhpZkteco\Libs\ZKTeco;
 use Throwable;
 
 class ZktecoAttendanceDeviceClient implements AttendanceDeviceClient
 {
+    public function __construct(
+        private readonly AttendanceRecordMapper $recordMapper,
+    ) {
+    }
+
     public function usersByDeviceId(): array
     {
         return $this->withConnection(function (ZKTeco $device): array {
@@ -38,7 +42,7 @@ class ZktecoAttendanceDeviceClient implements AttendanceDeviceClient
         return $this->withConnection(function (ZKTeco $device): array {
             return collect($device->getAttendances() ?: [])
                 ->filter(fn (mixed $record): bool => is_array($record))
-                ->map(fn (array $record): AttendanceRecord => $this->mapAttendanceRecord($record))
+                ->map(fn (array $record): AttendanceRecord => $this->recordMapper->fromDevicePayload($record))
                 ->filter(fn (AttendanceRecord $record): bool => $record->deviceUserId !== '')
                 ->values()
                 ->all();
@@ -117,52 +121,6 @@ class ZktecoAttendanceDeviceClient implements AttendanceDeviceClient
             password: (int) config('attendance.device.password'),
             protocol: (string) config('attendance.device.protocol', 'tcp'),
         );
-    }
-
-    /**
-     * @param array<string, mixed> $record
-     */
-    private function mapAttendanceRecord(array $record): AttendanceRecord
-    {
-        $timestamp = CarbonImmutable::parse((string) ($record['record_time'] ?? $record['timestamp'] ?? now()));
-        $stateCode = $record['state'] ?? null;
-        $verificationCode = $record['type'] ?? $record['verification_type'] ?? null;
-
-        return new AttendanceRecord(
-            deviceUserId: (string) ($record['user_id'] ?? $record['uid'] ?? ''),
-            employeeName: null,
-            timestamp: $timestamp,
-            state: $this->mapState($stateCode),
-            verificationType: $this->mapVerificationType($verificationCode),
-            rawData: $record,
-        );
-    }
-
-    private function mapState(mixed $state): string
-    {
-        return match ((string) $state) {
-            '0' => 'check_in',
-            '1' => 'check_out',
-            '2' => 'break_out',
-            '3' => 'break_in',
-            '4' => 'overtime_in',
-            '5' => 'overtime_out',
-            default => 'unknown',
-        };
-    }
-
-    private function mapVerificationType(mixed $type): string
-    {
-        return match ((string) $type) {
-            '0' => 'Password',
-            '1' => 'Fingerprint',
-            '2' => 'Card',
-            '3' => 'Password + Fingerprint',
-            '4' => 'Card + Fingerprint',
-            '15' => 'Face',
-            '' => 'Unknown',
-            default => "Unknown ({$type})",
-        };
     }
 
     private function nullableString(mixed $value): ?string

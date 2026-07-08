@@ -6,6 +6,10 @@ if (dashboard) {
     const stateClass = {
         check_in: 'bg-emerald-50 text-emerald-700 ring-emerald-200',
         check_out: 'bg-red-50 text-red-700 ring-red-200',
+        overtime_in: 'bg-blue-50 text-blue-700 ring-blue-200',
+        overtime_out: 'bg-amber-50 text-amber-700 ring-amber-200',
+        break_in: 'bg-violet-50 text-violet-700 ring-violet-200',
+        break_out: 'bg-orange-50 text-orange-700 ring-orange-200',
     };
 
     const elements = {
@@ -16,6 +20,9 @@ if (dashboard) {
         totalRecords: dashboard.querySelector('[data-total-records]'),
         rows: dashboard.querySelector('[data-attendance-rows]'),
     };
+    const refreshDelayMs = 3000;
+    let refreshTimerId = null;
+    let refreshInFlight = false;
 
     const formatDateTime = (value) => {
         if (!value) {
@@ -50,6 +57,19 @@ if (dashboard) {
         `;
     };
 
+    const applyPayload = (payload) => {
+        const today = payload?.totals ?? {};
+        const status = payload?.status ?? { online: false };
+
+        elements.totalCheckIns.textContent = today.total_check_ins ?? 0;
+        elements.totalCheckOuts.textContent = today.total_check_outs ?? 0;
+        elements.totalRecords.textContent = today.total_records ?? 0;
+        elements.lastSync.textContent = formatDateTime(today.last_sync_at);
+
+        renderRows(today.records ?? []);
+        renderStatus(status);
+    };
+
     const renderRows = (records) => {
         if (!records.length) {
             elements.rows.innerHTML = '<tr><td class="px-4 py-6 text-sm text-zinc-500" colspan="5">No attendance records today.</td></tr>';
@@ -75,36 +95,56 @@ if (dashboard) {
         }).join('');
     };
 
-    const refreshDashboard = async () => {
-        try {
-            const [todayResponse, statusResponse] = await Promise.all([
-                fetch('/api/attendance/today', { headers: { Accept: 'application/json' } }),
-                fetch('/api/device/status', { headers: { Accept: 'application/json' } }),
-            ]);
+    const scheduleRefresh = (delay = refreshDelayMs) => {
+        if (refreshTimerId) {
+            window.clearTimeout(refreshTimerId);
+        }
 
-            if (!todayResponse.ok || !statusResponse.ok) {
+        refreshTimerId = window.setTimeout(refreshDashboard, delay);
+    };
+
+    const refreshDashboard = async () => {
+        if (refreshInFlight) {
+            scheduleRefresh(500);
+            return;
+        }
+
+        refreshInFlight = true;
+
+        try {
+            const response = await fetch('/api/attendance/dashboard', {
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+            });
+
+            if (!response.ok) {
                 throw new Error('Unable to refresh attendance dashboard.');
             }
 
-            const [today, status] = await Promise.all([
-                todayResponse.json(),
-                statusResponse.json(),
-            ]);
+            const payload = await response.json();
 
-            elements.totalCheckIns.textContent = today.total_check_ins ?? 0;
-            elements.totalCheckOuts.textContent = today.total_check_outs ?? 0;
-            elements.totalRecords.textContent = today.total_records ?? 0;
-            elements.lastSync.textContent = formatDateTime(today.last_sync_at);
-
-            renderRows(today.records ?? []);
-            renderStatus(status);
+            applyPayload(payload);
         } catch (error) {
             renderStatus({ online: false });
-            elements.rows.innerHTML = '<tr><td class="px-4 py-6 text-sm text-red-600" colspan="5">Unable to load attendance data.</td></tr>';
-            console.error(error);
+
+            if (!navigator.onLine) {
+                elements.rows.innerHTML = '<tr><td class="px-4 py-6 text-sm text-red-600" colspan="5">Waiting for network connection...</td></tr>';
+            }
+        } finally {
+            refreshInFlight = false;
+            scheduleRefresh();
         }
     };
 
+    window.addEventListener('focus', () => {
+        scheduleRefresh(0);
+    });
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') {
+            scheduleRefresh(0);
+        }
+    });
+
     refreshDashboard();
-    window.setInterval(refreshDashboard, 30000);
 }

@@ -3,6 +3,7 @@
 namespace Tests\Feature;
 
 use App\Models\AttendanceLog;
+use App\Models\Employee;
 use App\Services\Attendance\AttendanceLogSynchronizer;
 use App\Services\Attendance\Contracts\AttendanceDeviceClient;
 use App\Services\Attendance\DTO\AttendanceRecord;
@@ -92,5 +93,141 @@ class AttendanceMonitoringTest extends TestCase
             ->assertJsonPath('total_records', 1)
             ->assertJsonPath('records.0.employee_name', 'Maya Haddad')
             ->assertJsonPath('records.0.state_label', 'Check In');
+    }
+
+    public function test_dashboard_endpoint_emits_live_dashboard_payload(): void
+    {
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-06 09:30:00'));
+
+        Employee::create([
+            'device_user_id' => '42',
+            'name' => 'Maya Haddad',
+        ]);
+
+        AttendanceLog::create([
+            'device_user_id' => '42',
+            'employee_name' => 'Maya Haddad',
+            'timestamp' => '2026-07-06 08:02:00',
+            'state' => 'check_in',
+            'verification_type' => 'Fingerprint',
+            'raw_data' => ['uid' => 42],
+        ]);
+
+        $this->app->bind(AttendanceDeviceClient::class, fn (): AttendanceDeviceClient => new class implements AttendanceDeviceClient
+        {
+            public function usersByDeviceId(): array
+            {
+                return ['42' => 'Maya Haddad'];
+            }
+
+            public function attendanceRecords(): array
+            {
+                return [];
+            }
+
+            public function status(): DeviceStatus
+            {
+                return new DeviceStatus(true, '2026-07-06 09:30:00', 'K40');
+            }
+        });
+
+        $response = $this->getJson('/api/attendance/dashboard');
+
+        $response->assertOk();
+        $response->assertJsonPath('totals.total_check_ins', 1);
+        $response->assertJsonPath('status.online', true);
+    }
+
+    public function test_sync_if_due_respects_polling_interval(): void
+    {
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-06 09:30:00'));
+
+        config()->set('attendance.device.polling_interval', 60);
+
+        $calls = 0;
+
+        $this->app->bind(AttendanceDeviceClient::class, function () use (&$calls): AttendanceDeviceClient {
+            return new class($calls) implements AttendanceDeviceClient
+            {
+                public function __construct(
+                    private int &$calls,
+                ) {
+                }
+
+                public function usersByDeviceId(): array
+                {
+                    $this->calls++;
+
+                    return ['42' => 'Maya Haddad'];
+                }
+
+                public function attendanceRecords(): array
+                {
+                    return [];
+                }
+
+                public function status(): DeviceStatus
+                {
+                    return new DeviceStatus(true);
+                }
+            };
+        });
+
+        $synchronizer = $this->app->make(AttendanceLogSynchronizer::class);
+
+        $first = $synchronizer->syncIfDue();
+        $second = $synchronizer->syncIfDue();
+
+        $this->assertTrue($first['ran']);
+        $this->assertFalse($second['ran']);
+        $this->assertSame(1, $calls);
+    }
+
+    public function test_sync_if_due_runs_again_after_polling_interval_has_elapsed(): void
+    {
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-06 09:30:00'));
+
+        config()->set('attendance.device.polling_interval', 5);
+
+        $calls = 0;
+
+        $this->app->bind(AttendanceDeviceClient::class, function () use (&$calls): AttendanceDeviceClient {
+            return new class($calls) implements AttendanceDeviceClient
+            {
+                public function __construct(
+                    private int &$calls,
+                ) {
+                }
+
+                public function usersByDeviceId(): array
+                {
+                    $this->calls++;
+
+                    return ['42' => 'Maya Haddad'];
+                }
+
+                public function attendanceRecords(): array
+                {
+                    return [];
+                }
+
+                public function status(): DeviceStatus
+                {
+                    return new DeviceStatus(true);
+                }
+            };
+        });
+
+        $synchronizer = $this->app->make(AttendanceLogSynchronizer::class);
+
+        $first = $synchronizer->syncIfDue();
+
+        CarbonImmutable::setTestNow(CarbonImmutable::parse('2026-07-06 09:30:06'));
+
+        $second = $synchronizer->syncIfDue();
+
+        $this->assertTrue($first['ran']);
+        $this->assertTrue($second['ran']);
+        $this->assertSame(2, $calls);
     }
 }

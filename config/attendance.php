@@ -9,5 +9,7 @@ return [
         'timeout' => (int) env('ZKTECO_TIMEOUT', 25),
         'should_ping' => (bool) env('ZKTECO_SHOULD_PING', false),
         'polling_interval' => (int) env('ATTENDANCE_POLLING_INTERVAL', 60),
+        'attendance_state_field' => env('ZKTECO_ATTENDANCE_STATE_FIELD', 'auto'),
+        'verification_field' => env('ZKTECO_VERIFICATION_FIELD', 'auto'),
     ],
 ];
