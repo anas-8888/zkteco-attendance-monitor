@@ -5,15 +5,21 @@ namespace App\Services\Attendance;
 use App\Models\AttendanceLog;
 use App\Models\Employee;
 use App\Services\Attendance\Contracts\AttendanceDeviceClient;
+use App\Services\Attendance\DTO\AttendanceRecord;
+use App\Services\Attendance\DTO\DeviceStatus;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use RuntimeException;
+use Symfony\Component\Process\PhpExecutableFinder;
 
 class AttendanceLogSynchronizer
 {
     private const LAST_ATTEMPT_CACHE_KEY = 'attendance.last_sync_attempt_at';
     private const SYNC_LOCK_CACHE_KEY = 'attendance.sync.lock';
+    private const SYNC_DISPATCH_LOCK_CACHE_KEY = 'attendance.sync.dispatch.lock';
+    private const DEVICE_STATUS_CACHE_KEY = 'attendance.device_status';
 
     public function __construct(
         private readonly AttendanceDeviceClient $device,
@@ -25,8 +31,71 @@ class AttendanceLogSynchronizer
      */
     public function sync(): array
     {
+        $lock = Cache::lock(self::SYNC_LOCK_CACHE_KEY, max(10, (int) config('attendance.device.timeout', 25)));
+
+        if (! $lock->get()) {
+            throw new RuntimeException('Attendance sync is already running.');
+        }
+
         Cache::put(self::LAST_ATTEMPT_CACHE_KEY, now()->toISOString());
 
+        try {
+            $result = $this->performSync();
+            $this->cacheDeviceStatus(new DeviceStatus(online: true));
+
+            return $result;
+        } catch (\Throwable $exception) {
+            $this->cacheDeviceStatus(new DeviceStatus(
+                online: false,
+                error: $exception->getMessage(),
+            ));
+
+            throw $exception;
+        } finally {
+            optional($lock)->release();
+        }
+    }
+
+    public function triggerBackgroundSyncIfDue(): void
+    {
+        if (! $this->shouldSync()) {
+            return;
+        }
+
+        $dispatchLock = Cache::lock(self::SYNC_DISPATCH_LOCK_CACHE_KEY, 5);
+
+        if (! $dispatchLock->get()) {
+            return;
+        }
+
+        try {
+            $this->launchBackgroundSyncProcess();
+            Cache::put(self::LAST_ATTEMPT_CACHE_KEY, now()->toISOString());
+        } catch (\Throwable $exception) {
+            Log::warning('Unable to dispatch attendance sync in the background.', [
+                'message' => $exception->getMessage(),
+            ]);
+        } finally {
+            optional($dispatchLock)->release();
+        }
+    }
+
+    /**
+     * @return array{online: bool, device_time: ?string, firmware_version: ?string, error: ?string}
+     */
+    public function cachedDeviceStatus(): array
+    {
+        return Cache::get(self::DEVICE_STATUS_CACHE_KEY, (new DeviceStatus(
+            online: false,
+        ))->toArray());
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int}
+     */
+    private function performSync(): array
+    {
+        
         $usersByDeviceId = $this->device->usersByDeviceId();
 
         foreach ($usersByDeviceId as $deviceUserId => $name) {
@@ -37,12 +106,29 @@ class AttendanceLogSynchronizer
         }
 
         $existingEmployees = Employee::pluck('name', 'device_user_id')->all();
-        $records = $this->device->attendanceRecords();
+        $records = collect($this->device->attendanceRecords())
+            ->sortBy(fn (AttendanceRecord $record): int => $record->timestamp->getTimestamp())
+            ->values();
         $inserted = 0;
         $skipped = 0;
+        $latestStatesByUser = [];
 
-        DB::transaction(function () use ($records, $usersByDeviceId, $existingEmployees, &$inserted, &$skipped): void {
+        DB::transaction(function () use ($records, $usersByDeviceId, $existingEmployees, &$inserted, &$skipped, &$latestStatesByUser): void {
             foreach ($records as $record) {
+                if ($this->isFutureDatedRecord($record)) {
+                    $skipped++;
+
+                    Log::warning('Skipping attendance record with a far-future timestamp.', [
+                        'device_user_id' => $record->deviceUserId,
+                        'timestamp' => $record->timestamp->toDateTimeString(),
+                        'raw_data' => $record->rawData,
+                    ]);
+
+                    continue;
+                }
+
+                $record = $this->resolveAmbiguousRecord($record, $latestStatesByUser);
+
                 $employeeName = $usersByDeviceId[$record->deviceUserId]
                     ?? $existingEmployees[$record->deviceUserId]
                     ?? $record->employeeName
@@ -62,6 +148,7 @@ class AttendanceLogSynchronizer
                 );
 
                 $log->wasRecentlyCreated ? $inserted++ : $skipped++;
+                $latestStatesByUser[$record->deviceUserId] = $record->state;
             }
         });
 
@@ -74,7 +161,7 @@ class AttendanceLogSynchronizer
         ]);
 
         return [
-            'fetched' => count($records),
+            'fetched' => $records->count(),
             'inserted' => $inserted,
             'skipped' => $skipped,
         ];
@@ -86,16 +173,6 @@ class AttendanceLogSynchronizer
     public function syncIfDue(): array
     {
         if (! $this->shouldSync()) {
-            return [
-                'ran' => false,
-                'result' => null,
-                'error' => null,
-            ];
-        }
-
-        $lock = Cache::lock(self::SYNC_LOCK_CACHE_KEY, max(10, (int) config('attendance.device.timeout', 25)));
-
-        if (! $lock->get()) {
             return [
                 'ran' => false,
                 'result' => null,
@@ -119,8 +196,6 @@ class AttendanceLogSynchronizer
                 'result' => null,
                 'error' => $exception->getMessage(),
             ];
-        } finally {
-            optional($lock)->release();
         }
     }
 
@@ -133,5 +208,101 @@ class AttendanceLogSynchronizer
         }
 
         return CarbonImmutable::parse($lastAttemptAt)->diffInSeconds(now()) >= (int) config('attendance.device.polling_interval', 60);
+    }
+
+    /**
+     * @param array<string, string> $latestStatesByUser
+     */
+    private function resolveAmbiguousRecord(AttendanceRecord $record, array &$latestStatesByUser): AttendanceRecord
+    {
+        if (! $this->isAmbiguousPunch($record)) {
+            return $record;
+        }
+
+        $previousState = $latestStatesByUser[$record->deviceUserId] ?? $this->latestStoredStateBefore($record);
+        $inferredState = in_array($previousState, ['check_in', 'break_in', 'overtime_in'], true)
+            ? 'check_out'
+            : 'check_in';
+
+        return new AttendanceRecord(
+            deviceUserId: $record->deviceUserId,
+            employeeName: $record->employeeName,
+            timestamp: $record->timestamp,
+            state: $inferredState,
+            verificationType: $this->inferVerificationTypeFromRawData($record),
+            rawData: $record->rawData,
+        );
+    }
+
+    private function isAmbiguousPunch(AttendanceRecord $record): bool
+    {
+        return $record->verificationType === 'Unknown (255)'
+            && (($record->rawData['type'] ?? null) === 255 || (string) ($record->rawData['type'] ?? '') === '255');
+    }
+
+    private function latestStoredStateBefore(AttendanceRecord $record): ?string
+    {
+        return AttendanceLog::query()
+            ->trusted()
+            ->where('device_user_id', $record->deviceUserId)
+            ->where('timestamp', '<', $record->timestamp->toDateTimeString())
+            ->orderByDesc('timestamp')
+            ->orderByDesc('id')
+            ->value('state');
+    }
+
+    private function isFutureDatedRecord(AttendanceRecord $record): bool
+    {
+        $toleranceSeconds = max(0, (int) config('attendance.device.future_timestamp_tolerance_seconds', 43200));
+
+        return $record->timestamp->greaterThan(CarbonImmutable::now()->addSeconds($toleranceSeconds));
+    }
+
+    private function inferVerificationTypeFromRawData(AttendanceRecord $record): string
+    {
+        return match ((string) ($record->rawData['state'] ?? '')) {
+            '0' => 'Password',
+            '1' => 'Fingerprint',
+            '2' => 'Card',
+            '3' => 'Password + Fingerprint',
+            '4' => 'Card + Fingerprint',
+            '15' => 'Face',
+            default => $record->verificationType,
+        };
+    }
+
+    private function cacheDeviceStatus(DeviceStatus $status): void
+    {
+        Cache::put(self::DEVICE_STATUS_CACHE_KEY, $status->toArray());
+    }
+
+    private function launchBackgroundSyncProcess(): void
+    {
+        $phpBinary = (new PhpExecutableFinder())->find(false) ?: PHP_BINARY;
+        $artisanPath = base_path('artisan');
+
+        if (DIRECTORY_SEPARATOR === '\\') {
+            $command = sprintf(
+                'cmd /c start "" /B %s %s attendance:sync --quiet --no-interaction',
+                escapeshellarg($phpBinary),
+                escapeshellarg($artisanPath),
+            );
+
+            pclose(popen($command, 'r'));
+
+            return;
+        }
+
+        $command = sprintf(
+            '%s %s attendance:sync --quiet --no-interaction > /dev/null 2>&1 &',
+            escapeshellarg($phpBinary),
+            escapeshellarg($artisanPath),
+        );
+
+        proc_open($command, [
+            0 => ['pipe', 'r'],
+            1 => ['file', '/dev/null', 'a'],
+            2 => ['file', '/dev/null', 'a'],
+        ], $pipes, base_path());
     }
 }

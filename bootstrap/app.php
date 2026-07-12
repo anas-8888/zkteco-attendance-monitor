@@ -1,6 +1,7 @@
 <?php
 
 use App\Console\Commands\AttendanceSyncCommand;
+use App\Http\Middleware\EnsureEnvAuthenticated;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -16,7 +17,9 @@ return Application::configure(basePath: dirname(__DIR__))
         AttendanceSyncCommand::class,
     ])
     ->withMiddleware(function (Middleware $middleware): void {
-        //
+        $middleware->web(append: [
+            EnsureEnvAuthenticated::class,
+        ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
         //

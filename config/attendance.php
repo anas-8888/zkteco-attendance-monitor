@@ -11,5 +11,11 @@ return [
         'polling_interval' => (int) env('ATTENDANCE_POLLING_INTERVAL', 60),
         'attendance_state_field' => env('ZKTECO_ATTENDANCE_STATE_FIELD', 'auto'),
         'verification_field' => env('ZKTECO_VERIFICATION_FIELD', 'auto'),
+        'future_timestamp_tolerance_seconds' => (int) env('ATTENDANCE_FUTURE_TOLERANCE_SECONDS', 43200),
+        'manual_duplicate_window_seconds' => (int) env('ATTENDANCE_MANUAL_DUPLICATE_WINDOW_SECONDS', 900),
+    ],
+    'schedule' => [
+        'start_time' => env('ATTENDANCE_WORK_START', '10:00'),
+        'end_time' => env('ATTENDANCE_WORK_END', '18:00'),
     ],
 ];

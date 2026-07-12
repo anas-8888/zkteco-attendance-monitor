@@ -13,5 +13,7 @@ class Employee extends Model
     protected $fillable = [
         'device_user_id',
         'name',
+        'work_start_time',
+        'work_end_time',
     ];
 }

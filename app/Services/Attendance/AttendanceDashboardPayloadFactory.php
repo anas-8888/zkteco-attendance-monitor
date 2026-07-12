@@ -2,20 +2,22 @@
 
 namespace App\Services\Attendance;
 
-use App\Models\AttendanceLog;
-use App\Services\Attendance\Contracts\AttendanceDeviceClient;
+use App\Models\Employee;
+use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Cache;
 
 class AttendanceDashboardPayloadFactory
 {
     public function __construct(
-        private readonly AttendanceDeviceClient $device,
+        private readonly AttendanceTimelineService $timelineService,
+        private readonly AttendanceWorkingHoursService $workingHoursService,
     ) {
     }
 
     /**
      * @return array{
      *     totals: array{
+     *         selected_date: string,
      *         total_check_ins: int,
      *         total_check_outs: int,
      *         total_records: int,
@@ -23,64 +25,64 @@ class AttendanceDashboardPayloadFactory
      *         last_sync_at: ?string,
      *         records: array<int, array<string, mixed>>
      *     },
+     *     working_hours: array{start_time: string, end_time: string},
+     *     employees: array<int, array{device_user_id: string, name: string}>,
      *     status: array{online: bool, device_time: ?string, firmware_version: ?string, error: ?string}
      * }
      */
-    public function make(): array
+    public function make(?CarbonImmutable $date = null): array
     {
-        $records = AttendanceLog::today()
-            ->latest('timestamp')
-            ->get();
+        $selectedDate = ($date ?? CarbonImmutable::now())->startOfDay();
+
+        $records = $this->timelineService->recordsOnDate($selectedDate);
 
         return [
             'totals' => [
+                'selected_date' => $selectedDate->toDateString(),
                 'total_check_ins' => $records->where('state', 'check_in')->count(),
                 'total_check_outs' => $records->where('state', 'check_out')->count(),
                 'total_records' => $records->count(),
-                'last_activity' => $records->first()?->timestamp?->toISOString(),
+                'last_activity' => $records->first()?->timestamp->toISOString(),
                 'last_sync_at' => Cache::get('attendance.last_sync_at'),
-                'records' => $records->map(fn (AttendanceLog $log): array => $this->serializeLog($log))->values()->all(),
+                'records' => $records->map(fn ($record): array => $this->serializeRecord($record))->values()->all(),
             ],
-            'status' => $this->device->status()->toArray(),
+            'working_hours' => $this->workingHoursService->configuration(),
+            'employees' => Employee::query()
+                ->orderBy('name')
+                ->get(['device_user_id', 'name', 'work_start_time', 'work_end_time'])
+                ->map(fn (Employee $employee): array => [
+                    'device_user_id' => $employee->device_user_id,
+                    'name' => $employee->name,
+                    'working_hours' => $this->workingHoursService->configurationForEmployee($employee),
+                ])
+                ->values()
+                ->all(),
+            'status' => Cache::get('attendance.device_status', [
+                'online' => false,
+                'device_time' => null,
+                'firmware_version' => null,
+                'error' => null,
+            ]),
         ];
     }
 
     /**
-     * @return array{
-     *     id: int,
-     *     device_user_id: string,
-     *     employee_name: string,
-     *     timestamp: ?string,
-     *     time: ?string,
-     *     state: string,
-     *     state_label: string,
-     *     verification_type: string
-     * }
+     * @param  \App\Services\Attendance\DTO\AttendanceTimelineRecord  $record
+     * @return array{id: int, device_user_id: string, employee_name: string, timestamp: string, time: string, state: string, state_label: string, verification_type: string, source: string, note: ?string}
      */
-    public function serializeLog(AttendanceLog $log): array
+    public function serializeRecord($record): array
     {
         return [
-            'id' => $log->id,
-            'device_user_id' => $log->device_user_id,
-            'employee_name' => $log->employee_name,
-            'timestamp' => $log->timestamp?->toISOString(),
-            'time' => $log->timestamp?->format('H:i:s'),
-            'state' => $log->state,
-            'state_label' => $this->stateLabel($log->state),
-            'verification_type' => $log->verification_type,
+            'id' => $record->id,
+            'device_user_id' => $record->deviceUserId,
+            'employee_name' => $record->employeeName,
+            'timestamp' => $record->timestamp->toISOString(),
+            'time' => $record->timestamp->format('H:i:s'),
+            'state' => $record->state,
+            'state_label' => $this->timelineService->stateLabel($record->state),
+            'verification_type' => $record->verificationType,
+            'source' => $record->source,
+            'note' => $record->note,
         ];
-    }
-
-    private function stateLabel(string $state): string
-    {
-        return match ($state) {
-            'check_in' => 'Check In',
-            'check_out' => 'Check Out',
-            'break_out' => 'Break Out',
-            'break_in' => 'Break In',
-            'overtime_in' => 'Overtime In',
-            'overtime_out' => 'Overtime Out',
-            default => 'Unknown',
-        };
     }
 }

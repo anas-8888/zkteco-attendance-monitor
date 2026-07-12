@@ -18,6 +18,8 @@
 /public/storage
 /storage/*.key
 /storage/pail
+/dist-electron
+/.electron
 /vendor
 Homestead.json
 Homestead.yaml
