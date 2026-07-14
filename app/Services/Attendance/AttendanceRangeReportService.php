@@ -34,6 +34,11 @@ class AttendanceRangeReportService
         $employee = Employee::query()->where('device_user_id', $deviceUserId)->first();
 
         $records = $this->timelineService->recordsForUserBetween($deviceUserId, $rangeStart, $rangeEnd);
+        $recordDates = [];
+
+        foreach ($records as $record) {
+            $recordDates[$record->timestamp->toDateString()] = true;
+        }
 
         $summary = $this->rangeSummaryService->summarize($deviceUserId, $fromDate, $toDate);
         $employeeName = $summary['employee_name']
@@ -58,10 +63,17 @@ class AttendanceRangeReportService
                     }
 
                     if ($attendanceSession) {
-                        $sessions[] = $this->leaveSessionOpen($attendanceSession, $employee);
+                        // Preserve the first attendance start so duplicate punches
+                        // or break returns do not create false late penalties.
+                        break;
                     }
 
-                    $attendanceSession = $this->startSession('attendance', $timestamp, $method);
+                    $attendanceSession = $this->startSession(
+                        'attendance',
+                        $timestamp,
+                        $method,
+                        $record->state === 'check_in',
+                    );
                     break;
 
                 case 'overtime_in':
@@ -71,7 +83,7 @@ class AttendanceRangeReportService
                     }
 
                     if ($overtimeSession) {
-                        $sessions[] = $this->leaveSessionOpen($overtimeSession, $employee);
+                        break;
                     }
 
                     $overtimeSession = $this->startSession('overtime', $timestamp, $method);
@@ -105,6 +117,10 @@ class AttendanceRangeReportService
 
         if ($overtimeSession) {
             $sessions[] = $this->leaveSessionOpen($overtimeSession, $employee);
+        }
+
+        foreach ($this->buildAbsentSessions($fromDate, $toDate, $recordDates, $employee) as $absentSession) {
+            $sessions[] = $absentSession;
         }
 
         usort($sessions, static fn (array $left, array $right): int => strcmp($right['started_at_iso'], $left['started_at_iso']));
@@ -161,6 +177,7 @@ class AttendanceRangeReportService
      * @return array{
      *     session_type: string,
      *     session_type_label: string,
+     *     counts_for_late: bool,
      *     attendance_date: string,
      *     check_in_time: string,
      *     check_out_time: ?string,
@@ -174,11 +191,12 @@ class AttendanceRangeReportService
      *     started_at: CarbonImmutable
      * }
      */
-    private function startSession(string $type, CarbonImmutable $startedAt, string $method): array
+    private function startSession(string $type, CarbonImmutable $startedAt, string $method, bool $countsForLate = true): array
     {
         return [
             'session_type' => $type,
             'session_type_label' => $type === 'overtime' ? 'Overtime' : 'Attendance',
+            'counts_for_late' => $countsForLate,
             'attendance_date' => $startedAt->toDateString(),
             'check_in_time' => $startedAt->format('H:i:s'),
             'check_out_time' => null,
@@ -236,7 +254,7 @@ class AttendanceRangeReportService
         /** @var CarbonImmutable $startedAt */
         $startedAt = $session['started_at'];
         $seconds = max($startedAt->diffInSeconds($endedAt), 0);
-        $late = $session['session_type'] === 'attendance'
+        $late = $session['session_type'] === 'attendance' && ($session['counts_for_late'] ?? false)
             ? $this->workingHoursService->lateForAttendanceSession(
                 $startedAt,
                 $endedAt,
@@ -267,7 +285,7 @@ class AttendanceRangeReportService
         $startedAt = $session['started_at'];
         $now = CarbonImmutable::now(config('app.timezone'));
         $isInProgress = $startedAt->isSameDay($now);
-        $late = $session['session_type'] === 'attendance'
+        $late = $session['session_type'] === 'attendance' && ($session['counts_for_late'] ?? false)
             ? $this->workingHoursService->lateForAttendanceSession(
                 $startedAt,
                 null,
@@ -288,6 +306,77 @@ class AttendanceRangeReportService
             'late_seconds' => $late['late_seconds'],
             'late_human' => $late['late_human'],
             'is_in_progress' => $isInProgress,
+        ];
+    }
+
+    /**
+     * @param  array<string, bool>  $recordDates
+     * @return array<int, array<string, mixed>>
+     */
+    private function buildAbsentSessions(
+        CarbonImmutable $fromDate,
+        CarbonImmutable $toDate,
+        array $recordDates,
+        ?Employee $employee = null,
+    ): array {
+        $sessions = [];
+        $cursor = $fromDate->startOfDay();
+        $lastDate = $toDate->startOfDay();
+
+        while ($cursor->lessThanOrEqualTo($lastDate)) {
+            if (! isset($recordDates[$cursor->toDateString()]) && $this->shouldMarkAsAbsent($cursor, $employee)) {
+                $sessions[] = $this->absentSessionForDate($cursor, $employee);
+            }
+
+            $cursor = $cursor->addDay();
+        }
+
+        return $sessions;
+    }
+
+    private function shouldMarkAsAbsent(CarbonImmutable $date, ?Employee $employee = null): bool
+    {
+        if ($this->workingHoursService->isOffDay($date, $employee)) {
+            return false;
+        }
+
+        $today = CarbonImmutable::now(config('app.timezone'))->startOfDay();
+
+        if ($date->lessThan($today)) {
+            return true;
+        }
+
+        if ($date->greaterThan($today)) {
+            return false;
+        }
+
+        $scheduledWindow = $this->workingHoursService->scheduledWorkWindowForDate($date, $employee);
+
+        return CarbonImmutable::now(config('app.timezone'))->greaterThanOrEqualTo($scheduledWindow['end_at']);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function absentSessionForDate(CarbonImmutable $attendanceDate, ?Employee $employee = null): array
+    {
+        $late = $this->workingHoursService->lateForAbsentDay($attendanceDate, $employee);
+
+        return [
+            'session_type' => 'absence',
+            'session_type_label' => 'Absent',
+            'counts_for_late' => true,
+            'attendance_date' => $attendanceDate->toDateString(),
+            'check_in_time' => null,
+            'check_out_time' => null,
+            'method' => 'No punches',
+            'duration_seconds' => 0,
+            'duration_human' => '0m',
+            'late_seconds' => $late['late_seconds'],
+            'late_human' => $late['late_human'],
+            'is_in_progress' => false,
+            'is_absent' => true,
+            'started_at_iso' => $attendanceDate->startOfDay()->toISOString(),
         ];
     }
 

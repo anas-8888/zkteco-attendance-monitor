@@ -2,6 +2,11 @@ import './bootstrap';
 
 document.querySelectorAll('[data-page-refresh]').forEach((button) => {
     button.addEventListener('click', () => {
+        if (document.querySelector('[data-attendance-dashboard]')) {
+            window.dispatchEvent(new CustomEvent('attendance-dashboard-refresh-requested'));
+            return;
+        }
+
         window.location.reload();
     });
 });
@@ -62,6 +67,7 @@ if (dashboard) {
     const refreshDelayMs = 3000;
     let refreshTimerId = null;
     let refreshInFlight = false;
+    let liveStatusRefreshInFlight = false;
     let summaryInFlight = false;
     let manualCheckInInFlight = false;
     let manualCheckOutInFlight = false;
@@ -69,6 +75,7 @@ if (dashboard) {
     let workingHours = {
         start_time: '10:00',
         end_time: '18:00',
+        off_days: [0],
     };
     let selectedDate = (() => {
         const urlDate = new URL(window.location.href).searchParams.get('date');
@@ -84,10 +91,34 @@ if (dashboard) {
             hour: '2-digit',
             minute: '2-digit',
             second: '2-digit',
+            hour12: true,
             year: 'numeric',
             month: 'short',
             day: '2-digit',
         }).format(new Date(value));
+    };
+
+    const formatClockTime = (value) => {
+        const normalized = String(value ?? '').trim();
+
+        if (!normalized || normalized === '--') {
+            return '--';
+        }
+
+        const match = normalized.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+
+        if (!match) {
+            return normalized;
+        }
+
+        const [, hours, minutes, seconds = '00'] = match;
+        const date = new Date(2000, 0, 1, Number(hours), Number(minutes), Number(seconds));
+
+        return new Intl.DateTimeFormat(englishLocale, {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true,
+        }).format(date);
     };
 
     const formatDate = (value) => {
@@ -167,7 +198,31 @@ if (dashboard) {
         return `${minutes}m`;
     };
 
+    const normalizeOffDays = (value) => Array.isArray(value)
+        ? value
+            .map((day) => Number.parseInt(day, 10))
+            .filter((day) => Number.isInteger(day) && day >= 0 && day <= 6)
+        : [];
+
+    const isOffDay = (dateValue, hours = workingHours) => {
+        if (!dateValue) {
+            return false;
+        }
+
+        const offDays = normalizeOffDays(hours?.off_days);
+
+        if (!offDays.length) {
+            return false;
+        }
+
+        return offDays.includes(parseDateString(dateValue).getDay());
+    };
+
     const calculateLateDuration = (checkInTime, hours = workingHours) => {
+        if (isOffDay(getActiveDateString(), hours)) {
+            return '0m';
+        }
+
         const workStartMinutes = parseTimeToMinutes(hours.start_time);
 
         if (workStartMinutes === null) {
@@ -193,8 +248,12 @@ if (dashboard) {
         return employee?.working_hours ?? workingHours;
     };
 
-    const calculateEmployeeLateDuration = (deviceUserId, checkInTime) => {
+    const calculateEmployeeLateDuration = (deviceUserId, checkInTime, attendanceDate = getActiveDateString()) => {
         const employeeWorkingHours = resolveEmployeeWorkingHours(deviceUserId);
+
+        if (isOffDay(attendanceDate, employeeWorkingHours)) {
+            return '0m';
+        }
 
         return calculateLateDuration(checkInTime, employeeWorkingHours);
     };
@@ -217,7 +276,6 @@ if (dashboard) {
     };
 
     const isViewingToday = () => getActiveDateString() === getTodayDateString();
-
     const syncSelectedDateWithUrl = () => {
         const url = new URL(window.location.href);
 
@@ -431,19 +489,59 @@ if (dashboard) {
     };
 
     const renderStatus = (status) => {
-        const online = Boolean(status?.online);
-        const color = online ? 'bg-emerald-500' : 'bg-rose-500';
-        const label = online ? 'Online' : 'Offline';
+        const checking = Boolean(status?.checking);
+        const online = !checking && Boolean(status?.online);
+        const color = checking ? 'bg-amber-400' : (online ? 'bg-emerald-500' : 'bg-rose-500');
+        const label = checking ? 'Checking...' : (online ? 'Online' : 'Offline');
+        const statusTitle = checking
+            ? 'Checking the live device status...'
+            : (online
+                ? 'Device is reachable right now.'
+                : (status?.error ? `Offline: ${status.error}` : 'Device is not reachable right now.'));
 
         elements.deviceStatus.innerHTML = `
-            <span class="h-2.5 w-2.5 rounded-full ${color}"></span>
+            <span class="h-2.5 w-2.5 rounded-full ${color}" title="${escapeHtml(statusTitle)}"></span>
             ${label}
         `;
+
+        elements.deviceStatus.setAttribute('title', statusTitle);
+    };
+
+    const refreshLiveDeviceStatus = async ({ triggerSyncOnOnline = false } = {}) => {
+        if (liveStatusRefreshInFlight) {
+            return;
+        }
+
+        liveStatusRefreshInFlight = true;
+
+        try {
+            const response = await fetch('/api/device/status', {
+                headers: { Accept: 'application/json' },
+                cache: 'no-store',
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to read the live device status.');
+            }
+
+            const status = await response.json();
+            renderStatus(status);
+
+            if (triggerSyncOnOnline && status?.online && isViewingToday() && !refreshInFlight) {
+                refreshDashboard({ dispatchSync: true });
+            }
+        } catch (error) {
+            renderStatus({
+                online: false,
+                error: error?.message ?? 'Failed to read the live device status.',
+            });
+        } finally {
+            liveStatusRefreshInFlight = false;
+        }
     };
 
     const applyPayload = (payload) => {
         const summary = payload?.totals ?? {};
-        const status = payload?.status ?? { online: false };
         employees = Array.isArray(payload?.employees) ? payload.employees : [];
         workingHours = payload?.working_hours ?? workingHours;
         selectedDate = summary.selected_date && summary.selected_date !== getTodayDateString()
@@ -458,7 +556,6 @@ if (dashboard) {
 
         renderRows(summary.records ?? []);
         renderEmployeeOptions();
-        renderStatus(status);
         updateDateControls();
         updateSummaryDefaults();
         updateManualCheckInDefaults();
@@ -512,10 +609,8 @@ if (dashboard) {
 
             if (record.state === 'check_in' && record.timestamp) {
                 if (openSession) {
-                    openSession.check_in_at = record.timestamp;
-                    openSession.check_in_time = record.time ?? '--';
-                    openSession.check_in_method = record.verification_type ?? 'Unknown';
                     openSession.latest_activity_at = record.timestamp;
+                    openSession.latest_event_id = Number(record.id ?? 0);
                 } else {
                     const session = {
                         employee_name: record.employee_name,
@@ -611,7 +706,7 @@ if (dashboard) {
             const employeeWorkingHours = resolveEmployeeWorkingHours(deviceUserId);
             const workStartMinutes = parseTimeToMinutes(employeeWorkingHours.start_time);
 
-            if (workStartMinutes === null || nowMinutes <= workStartMinutes) {
+            if (isOffDay(getActiveDateString(), employeeWorkingHours) || workStartMinutes === null || nowMinutes <= workStartMinutes) {
                 return rows;
             }
 
@@ -652,6 +747,7 @@ if (dashboard) {
             const lateDuration = record.late_duration_override ?? calculateEmployeeLateDuration(
                 record.device_user_id,
                 record.check_in_time,
+                record.attendance_date ? new Date(record.attendance_date).toISOString().slice(0, 10) : getActiveDateString(),
             );
             const rowClass = isMissingCheckIn ? 'bg-amber-50/60' : 'bg-white';
             const employeeNameMarkup = isMissingCheckIn
@@ -667,8 +763,8 @@ if (dashboard) {
                 <tr class="${rowClass}">
                     <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(record.device_user_id)}</td>
                     ${employeeNameMarkup}
-                    <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(record.check_in_time ?? '--')}</td>
-                    <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(record.check_out_time ?? '--')}</td>
+                    <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(formatClockTime(record.check_in_time))}</td>
+                    <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(formatClockTime(record.check_out_time))}</td>
                     <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(attendanceDuration)}</td>
                     <td class="whitespace-nowrap px-4 py-4 text-sm font-medium ${lateDuration !== '--' && lateDuration !== '0m' ? 'text-amber-700' : 'text-slate-600'}">${escapeHtml(lateDuration)}</td>
                     <td class="whitespace-nowrap px-4 py-4 text-sm text-slate-600">${escapeHtml(record.check_in_method ?? '--')}</td>
@@ -798,17 +894,24 @@ if (dashboard) {
         refreshTimerId = window.setTimeout(refreshDashboard, delay);
     };
 
-    const refreshDashboard = async () => {
+    const refreshDashboard = async ({ forceSync = false, dispatchSync = false } = {}) => {
         if (refreshInFlight) {
             scheduleRefresh(500);
             return;
         }
 
         refreshInFlight = true;
+        renderStatus({ checking: true });
 
         try {
             const url = new URL('/api/attendance/dashboard', window.location.origin);
             url.searchParams.set('date', getActiveDateString());
+
+            if (forceSync && isViewingToday()) {
+                url.searchParams.set('force_sync', '1');
+            } else if (dispatchSync && isViewingToday()) {
+                url.searchParams.set('dispatch_sync', '1');
+            }
 
             const response = await fetch(url, {
                 headers: { Accept: 'application/json' },
@@ -822,6 +925,9 @@ if (dashboard) {
             const payload = await response.json();
 
             applyPayload(payload);
+            window.setTimeout(() => {
+                refreshLiveDeviceStatus();
+            }, 0);
         } catch (error) {
             renderStatus({ online: false });
 
@@ -843,6 +949,11 @@ if (dashboard) {
         event.stopPropagation();
         closeSummaryModal();
         openDateModal();
+    });
+
+    window.addEventListener('attendance-dashboard-refresh-requested', () => {
+        renderLoadingRows();
+        refreshDashboard({ dispatchSync: true });
     });
 
     elements.dateModalCloseButtons.forEach((button) => {
@@ -1130,15 +1241,32 @@ if (dashboard) {
     });
 
     window.addEventListener('focus', () => {
+        refreshLiveDeviceStatus({ triggerSyncOnOnline: true });
+
         if (isViewingToday()) {
             scheduleRefresh(0);
         }
     });
 
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible' && isViewingToday()) {
-            scheduleRefresh(0);
+        if (document.visibilityState === 'visible') {
+            refreshLiveDeviceStatus({ triggerSyncOnOnline: true });
+
+            if (isViewingToday()) {
+                scheduleRefresh(0);
+            }
         }
+    });
+
+    window.addEventListener('online', () => {
+        refreshLiveDeviceStatus({ triggerSyncOnOnline: true });
+    });
+
+    window.addEventListener('offline', () => {
+        renderStatus({
+            online: false,
+            error: 'The computer is offline.',
+        });
     });
 
     updateDateControls();

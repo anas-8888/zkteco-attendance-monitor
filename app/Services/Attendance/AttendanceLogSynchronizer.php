@@ -8,6 +8,7 @@ use App\Services\Attendance\Contracts\AttendanceDeviceClient;
 use App\Services\Attendance\DTO\AttendanceRecord;
 use App\Services\Attendance\DTO\DeviceStatus;
 use Carbon\CarbonImmutable;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -31,12 +32,64 @@ class AttendanceLogSynchronizer
      */
     public function sync(): array
     {
-        $lock = Cache::lock(self::SYNC_LOCK_CACHE_KEY, max(10, (int) config('attendance.device.timeout', 25)));
+        return $this->runSync(waitForExistingSync: false);
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int}
+     */
+    public function forceSync(): array
+    {
+        return $this->runSync(waitForExistingSync: true);
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int, deleted: int}
+     */
+    public function reconcileWithDevice(): array
+    {
+        $lockTtlSeconds = max(10, (int) config('attendance.device.timeout', 25));
+        $lock = Cache::lock(self::SYNC_LOCK_CACHE_KEY, $lockTtlSeconds);
+
+        try {
+            return $lock->block($lockTtlSeconds, fn (): array => $this->runLockedReconciliation());
+        } catch (LockTimeoutException $exception) {
+            throw new RuntimeException('Attendance sync is already running.', previous: $exception);
+        }
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int}
+     */
+    private function runSync(bool $waitForExistingSync): array
+    {
+        $lockTtlSeconds = max(10, (int) config('attendance.device.timeout', 25));
+        $lock = Cache::lock(self::SYNC_LOCK_CACHE_KEY, $lockTtlSeconds);
+
+        if ($waitForExistingSync) {
+            try {
+                return $lock->block($lockTtlSeconds, fn (): array => $this->runLockedSync());
+            } catch (LockTimeoutException $exception) {
+                throw new RuntimeException('Attendance sync is already running.', previous: $exception);
+            }
+        }
 
         if (! $lock->get()) {
             throw new RuntimeException('Attendance sync is already running.');
         }
 
+        try {
+            return $this->runLockedSync();
+        } finally {
+            optional($lock)->release();
+        }
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int}
+     */
+    private function runLockedSync(): array
+    {
         Cache::put(self::LAST_ATTEMPT_CACHE_KEY, now()->toISOString());
 
         try {
@@ -51,14 +104,39 @@ class AttendanceLogSynchronizer
             ));
 
             throw $exception;
-        } finally {
-            optional($lock)->release();
+        }
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int, deleted: int}
+     */
+    private function runLockedReconciliation(): array
+    {
+        Cache::put(self::LAST_ATTEMPT_CACHE_KEY, now()->toISOString());
+
+        try {
+            $result = $this->performReconciliation();
+            $this->cacheDeviceStatus(new DeviceStatus(online: true));
+
+            return $result;
+        } catch (\Throwable $exception) {
+            $this->cacheDeviceStatus(new DeviceStatus(
+                online: false,
+                error: $exception->getMessage(),
+            ));
+
+            throw $exception;
         }
     }
 
     public function triggerBackgroundSyncIfDue(): void
     {
-        if (! $this->shouldSync()) {
+        $this->triggerBackgroundSync();
+    }
+
+    public function triggerBackgroundSync(bool $force = false): void
+    {
+        if (! $force && ! $this->shouldSync()) {
             return;
         }
 
@@ -95,7 +173,6 @@ class AttendanceLogSynchronizer
      */
     private function performSync(): array
     {
-        
         $usersByDeviceId = $this->device->usersByDeviceId();
 
         foreach ($usersByDeviceId as $deviceUserId => $name) {
@@ -164,6 +241,103 @@ class AttendanceLogSynchronizer
             'fetched' => $records->count(),
             'inserted' => $inserted,
             'skipped' => $skipped,
+        ];
+    }
+
+    /**
+     * @return array{fetched: int, inserted: int, skipped: int, deleted: int}
+     */
+    private function performReconciliation(): array
+    {
+        $usersByDeviceId = $this->device->usersByDeviceId();
+
+        foreach ($usersByDeviceId as $deviceUserId => $name) {
+            Employee::updateOrCreate(
+                ['device_user_id' => $deviceUserId],
+                ['name' => $name],
+            );
+        }
+
+        $existingEmployees = Employee::pluck('name', 'device_user_id')->all();
+        $records = collect($this->device->attendanceRecords())
+            ->sortBy(fn (AttendanceRecord $record): int => $record->timestamp->getTimestamp())
+            ->values();
+        $inserted = 0;
+        $skipped = 0;
+        $deleted = 0;
+        $latestStatesByUser = [];
+        $deviceKeys = [];
+
+        DB::transaction(function () use (
+            $records,
+            $usersByDeviceId,
+            $existingEmployees,
+            &$inserted,
+            &$skipped,
+            &$deleted,
+            &$latestStatesByUser,
+            &$deviceKeys,
+        ): void {
+            foreach ($records as $record) {
+                if ($this->isFutureDatedRecord($record)) {
+                    $skipped++;
+
+                    Log::warning('Skipping attendance record with a far-future timestamp during reconciliation.', [
+                        'device_user_id' => $record->deviceUserId,
+                        'timestamp' => $record->timestamp->toDateTimeString(),
+                        'raw_data' => $record->rawData,
+                    ]);
+
+                    continue;
+                }
+
+                $record = $this->resolveAmbiguousRecord($record, $latestStatesByUser);
+                $deviceKeys[$this->deviceRecordKey(
+                    $record->deviceUserId,
+                    $record->timestamp->toDateTimeString(),
+                    $record->state,
+                    $record->verificationType,
+                )] = true;
+
+                $employeeName = $usersByDeviceId[$record->deviceUserId]
+                    ?? $existingEmployees[$record->deviceUserId]
+                    ?? $record->employeeName
+                    ?? "User {$record->deviceUserId}";
+
+                $log = AttendanceLog::firstOrCreate(
+                    [
+                        'device_user_id' => $record->deviceUserId,
+                        'timestamp' => $record->timestamp->toDateTimeString(),
+                        'state' => $record->state,
+                        'verification_type' => $record->verificationType,
+                    ],
+                    [
+                        'employee_name' => $employeeName,
+                        'raw_data' => $record->rawData,
+                    ],
+                );
+
+                $log->wasRecentlyCreated ? $inserted++ : $skipped++;
+                $latestStatesByUser[$record->deviceUserId] = $record->state;
+            }
+
+            $deleted = $this->deleteLogsMissingFromDevice($deviceKeys);
+        });
+
+        Cache::put('attendance.last_sync_at', now()->toISOString());
+
+        Log::info('Attendance reconciliation completed.', [
+            'fetched' => count($records),
+            'inserted' => $inserted,
+            'skipped' => $skipped,
+            'deleted' => $deleted,
+        ]);
+
+        return [
+            'fetched' => $records->count(),
+            'inserted' => $inserted,
+            'skipped' => $skipped,
+            'deleted' => $deleted,
         ];
     }
 
@@ -274,6 +448,54 @@ class AttendanceLogSynchronizer
     private function cacheDeviceStatus(DeviceStatus $status): void
     {
         Cache::put(self::DEVICE_STATUS_CACHE_KEY, $status->toArray());
+    }
+
+    /**
+     * @param  array<string, bool>  $deviceKeys
+     */
+    private function deleteLogsMissingFromDevice(array $deviceKeys): int
+    {
+        $deleted = 0;
+
+        AttendanceLog::query()
+            ->select(['id', 'device_user_id', 'timestamp', 'state', 'verification_type'])
+            ->orderBy('id')
+            ->chunkById(500, function ($logs) use ($deviceKeys, &$deleted): void {
+                $idsToDelete = $logs
+                    ->filter(function (AttendanceLog $log) use ($deviceKeys): bool {
+                        return ! isset($deviceKeys[$this->deviceRecordKey(
+                            $log->device_user_id,
+                            $log->timestamp->toDateTimeString(),
+                            $log->state,
+                            $log->verification_type,
+                        )]);
+                    })
+                    ->pluck('id')
+                    ->all();
+
+                if ($idsToDelete === []) {
+                    return;
+                }
+
+                $deleted += count($idsToDelete);
+                AttendanceLog::query()->whereIn('id', $idsToDelete)->delete();
+            });
+
+        return $deleted;
+    }
+
+    private function deviceRecordKey(
+        string $deviceUserId,
+        string $timestamp,
+        string $state,
+        string $verificationType,
+    ): string {
+        return implode('|', [
+            $deviceUserId,
+            $timestamp,
+            $state,
+            $verificationType,
+        ]);
     }
 
     private function launchBackgroundSyncProcess(): void

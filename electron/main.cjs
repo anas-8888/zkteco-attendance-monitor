@@ -20,6 +20,18 @@ let mainWindow = null;
 let phpServerProcess = null;
 let phpServerOutput = [];
 
+function installerMetadataRoot() {
+    return path.join(app.getPath('appData'), 'nexa-attendance-monitor');
+}
+
+function initializedFlagPath() {
+    return path.join(installerMetadataRoot(), 'initialized.flag');
+}
+
+function isInitializationMode() {
+    return process.argv.includes('--initialize');
+}
+
 function appIconPath() {
     if (app.isPackaged) {
         return path.join(process.resourcesPath, 'assets', 'icon.ico');
@@ -86,6 +98,7 @@ async function synchronizeRuntimeEnv(runtimeRoot) {
     envContents = setEnvValue(envContents, 'SESSION_DRIVER', 'file');
     envContents = setEnvValue(envContents, 'CACHE_STORE', 'file');
     envContents = setEnvValue(envContents, 'QUEUE_CONNECTION', 'sync');
+    envContents = setEnvValue(envContents, 'APP_ALLOW_BROWSER_SETUP', 'false');
     envContents = setEnvValue(
         envContents,
         'DB_DATABASE',
@@ -150,7 +163,7 @@ async function ensureRuntimeWorkspace() {
     return runtimeRoot;
 }
 
-async function runPhpCommand(args, workingDirectory) {
+async function runPhpCommandDetailed(args, workingDirectory, extraEnv = {}) {
     const phpBinary = phpBinaryPath();
     const phpIni = phpConfigurationPath();
     const fullArgs = [];
@@ -161,11 +174,12 @@ async function runPhpCommand(args, workingDirectory) {
 
     fullArgs.push(...args);
 
-    await new Promise((resolve, reject) => {
+    return await new Promise((resolve, reject) => {
         const child = spawn(phpBinary, fullArgs, {
             cwd: workingDirectory,
             env: {
                 ...process.env,
+                ...extraEnv,
                 APP_URL: `http://127.0.0.1:${appPort}`,
             },
             windowsHide: true,
@@ -184,20 +198,155 @@ async function runPhpCommand(args, workingDirectory) {
 
         child.once('error', reject);
         child.once('exit', (code) => {
-            if (code === 0) {
-                resolve();
-                return;
-            }
-
-            reject(new Error(
-                `PHP command failed (${fullArgs.join(' ')}), exit code ${code ?? 'null'}.\n${output.trim()}`
-            ));
+            resolve({
+                code: code ?? 1,
+                fullArgs,
+                output: output.trim(),
+            });
         });
     });
 }
 
+async function runPhpCommand(args, workingDirectory, extraEnv = {}) {
+    const result = await runPhpCommandDetailed(args, workingDirectory, extraEnv);
+
+    if (result.code === 0) {
+        return result.output;
+    }
+
+    throw new Error(
+        `PHP command failed (${result.fullArgs.join(' ')}), exit code ${result.code}.\n${result.output}`
+    );
+}
+
 async function migrateRuntimeDatabase(runtimeRoot) {
     await runPhpCommand(['artisan', 'migrate', '--force'], runtimeRoot);
+}
+
+function parseJsonCommandOutput(output) {
+    const trimmed = String(output ?? '').trim();
+
+    if (trimmed === '') {
+        throw new Error('The Laravel command did not return any output.');
+    }
+
+    const jsonLine = trimmed
+        .split(/\r?\n/)
+        .filter((line) => line.trim() !== '')
+        .at(-1);
+
+    return JSON.parse(jsonLine ?? trimmed);
+}
+
+function sanitizeIniValue(value) {
+    return String(value ?? '')
+        .replace(/[\r\n]+/g, ' ')
+        .replaceAll('[', '(')
+        .replaceAll(']', ')')
+        .trim();
+}
+
+async function writeInitializationStatusFile(success, message) {
+    const statusFilePath = process.env.NEXA_INSTALLER_STATUS_FILE;
+
+    if (!statusFilePath) {
+        return;
+    }
+
+    const contents = [
+        '[Initialization]',
+        `success=${success ? '1' : '0'}`,
+        `message=${sanitizeIniValue(message)}`,
+        '',
+    ].join('\r\n');
+
+    await writeFile(statusFilePath, contents, 'utf8');
+}
+
+async function writeInitializedFlag() {
+    await mkdir(installerMetadataRoot(), { recursive: true });
+    await writeFile(initializedFlagPath(), 'initialized=1\r\n', 'utf8');
+}
+
+async function initializationStatus(runtimeRoot) {
+    const output = await runPhpCommand(
+        ['artisan', 'app:initialization-status', '--json'],
+        runtimeRoot,
+    );
+
+    return parseJsonCommandOutput(output);
+}
+
+async function initializeApplication(runtimeRoot) {
+    // The installer passes credentials through one-time environment variables so
+    // Laravel receives the raw password without us writing it to disk first.
+    const result = await runPhpCommandDetailed(
+        ['artisan', 'app:initialize', '--json'],
+        runtimeRoot,
+        {
+            NEXA_INSTALLER_USERNAME: process.env.NEXA_INSTALLER_USERNAME ?? '',
+            NEXA_INSTALLER_PASSWORD: process.env.NEXA_INSTALLER_PASSWORD ?? '',
+            NEXA_INSTALLER_PASSWORD_CONFIRMATION: process.env.NEXA_INSTALLER_PASSWORD_CONFIRMATION ?? '',
+        },
+    );
+
+    let parsedResult;
+
+    try {
+        parsedResult = parseJsonCommandOutput(result.output);
+    } catch {
+        parsedResult = {
+            success: false,
+            message: result.output || 'The Laravel initialization command did not return a valid response.',
+        };
+    }
+
+    await writeInitializationStatusFile(
+        result.code === 0 && parsedResult.success === true,
+        parsedResult.message ?? 'The application could not be initialized.',
+    );
+
+    if (result.code !== 0 || parsedResult.success !== true) {
+        throw new Error(parsedResult.message ?? 'The application could not be initialized.');
+    }
+
+    await writeInitializedFlag();
+}
+
+async function startupPath(runtimeRoot) {
+    const status = await initializationStatus(runtimeRoot);
+
+    if (status.initialized) {
+        await writeInitializedFlag();
+        return '/login';
+    }
+
+    if (status.allow_browser_setup) {
+        return '/setup';
+    }
+
+    throw new Error(
+        typeof status.message === 'string' && status.message !== ''
+            ? status.message
+            : 'Installation did not complete correctly. Run the installer again.'
+    );
+}
+
+async function runInitializationMode() {
+    const runtimeRoot = await ensureRuntimeWorkspace();
+
+    try {
+        await migrateRuntimeDatabase(runtimeRoot);
+        await initializeApplication(runtimeRoot);
+        app.exit(0);
+    } catch (error) {
+        const message = error instanceof Error
+            ? error.message
+            : 'An unexpected initialization error occurred.';
+
+        await writeInitializationStatusFile(false, message);
+        app.exit(1);
+    }
 }
 
 function phpBinaryPath() {
@@ -243,6 +392,7 @@ async function waitForServer(url, timeoutMs = 30000) {
 async function startPhpServer() {
     const runtimeRoot = await ensureRuntimeWorkspace();
     await migrateRuntimeDatabase(runtimeRoot);
+    const initialPath = await startupPath(runtimeRoot);
     const publicRoot = path.join(runtimeRoot, 'public');
     const phpBinary = phpBinaryPath();
     const phpIni = phpConfigurationPath();
@@ -271,7 +421,7 @@ async function startPhpServer() {
     }
 
     if (!app.isPackaged && phpServerProcess) {
-        return;
+        return initialPath;
     }
 
     const args = [];
@@ -323,11 +473,13 @@ async function startPhpServer() {
         }
     });
 
-    await waitForServer(`http://127.0.0.1:${appPort}/login`);
+    await waitForServer(`http://127.0.0.1:${appPort}${initialPath}`);
+
+    return initialPath;
 }
 
 async function createMainWindow() {
-    await startPhpServer();
+    const initialPath = await startPhpServer();
 
     mainWindow = new BrowserWindow({
         width: 1440,
@@ -346,7 +498,7 @@ async function createMainWindow() {
         },
     });
 
-    await mainWindow.loadURL(`http://127.0.0.1:${appPort}/`);
+    await mainWindow.loadURL(`http://127.0.0.1:${appPort}${initialPath}`);
 
     mainWindow.on('closed', () => {
         mainWindow = null;
@@ -393,8 +545,24 @@ app.on('activate', async () => {
 });
 
 app.whenReady()
-    .then(createMainWindow)
+    .then(async () => {
+        if (isInitializationMode()) {
+            await runInitializationMode();
+            return;
+        }
+
+        await createMainWindow();
+    })
     .catch(async (error) => {
+        if (isInitializationMode()) {
+            await writeInitializationStatusFile(
+                false,
+                error instanceof Error ? error.message : 'An unexpected initialization error occurred.',
+            );
+            app.exit(1);
+            return;
+        }
+
         await dialog.showMessageBox({
             type: 'error',
             title: 'Unable to Start Nexa Attendance Monitor',

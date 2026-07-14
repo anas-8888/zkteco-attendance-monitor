@@ -79,39 +79,65 @@ class ZktecoAttendanceDeviceClient implements AttendanceDeviceClient
      */
     private function withConnection(callable $callback): mixed
     {
-        $device = $this->makeDevice();
-        $connected = false;
+        $errors = [];
 
-        try {
-            $connected = (bool) $device->connect();
+        foreach ($this->connectionProtocols() as $protocol) {
+            $device = null;
+            $connected = false;
 
-            if (! $connected) {
-                throw new DeviceConnectionException('Unable to connect to the ZKTeco device.');
-            }
+            try {
+                $device = $this->makeDevice($protocol);
+                $connected = (bool) $device->connect();
 
-            return $callback($device);
-        } catch (Throwable $exception) {
-            Log::error('ZKTeco communication failed.', [
-                'ip' => config('attendance.device.ip'),
-                'port' => config('attendance.device.port'),
-                'message' => $exception->getMessage(),
-            ]);
+                if (! $connected) {
+                    throw new DeviceConnectionException("Unable to connect to the ZKTeco device over {$protocol}.");
+                }
 
-            throw $exception;
-        } finally {
-            if ($connected) {
-                try {
-                    $device->disconnect();
-                } catch (Throwable $exception) {
-                    Log::warning('Unable to disconnect from ZKTeco device cleanly.', [
-                        'message' => $exception->getMessage(),
-                    ]);
+                return $callback($device);
+            } catch (Throwable $exception) {
+                $errors[] = sprintf('%s: %s', strtoupper($protocol), $exception->getMessage());
+
+                Log::error('ZKTeco communication failed.', [
+                    'ip' => config('attendance.device.ip'),
+                    'port' => config('attendance.device.port'),
+                    'protocol' => $protocol,
+                    'message' => $exception->getMessage(),
+                ]);
+            } finally {
+                if ($connected && $device !== null) {
+                    try {
+                        $device->disconnect();
+                    } catch (Throwable $exception) {
+                        Log::warning('Unable to disconnect from ZKTeco device cleanly.', [
+                            'message' => $exception->getMessage(),
+                        ]);
+                    }
                 }
             }
         }
+
+        throw new DeviceConnectionException(
+            $errors !== []
+                ? implode(' | ', $errors)
+                : 'Unable to connect to the ZKTeco device.'
+        );
     }
 
-    private function makeDevice(): ZKTeco
+    /**
+     * @return array<int, string>
+     */
+    private function connectionProtocols(): array
+    {
+        $configuredProtocol = strtolower(trim((string) config('attendance.device.protocol', 'tcp')));
+
+        return match ($configuredProtocol) {
+            'udp' => ['udp', 'tcp'],
+            'auto' => ['tcp', 'udp'],
+            default => ['tcp', 'udp'],
+        };
+    }
+
+    private function makeDevice(string $protocol): ZKTeco
     {
         return new ZKTeco(
             host: (string) config('attendance.device.ip'),
@@ -119,7 +145,7 @@ class ZktecoAttendanceDeviceClient implements AttendanceDeviceClient
             shouldPing: (bool) config('attendance.device.should_ping'),
             timeout: (int) config('attendance.device.timeout'),
             password: (int) config('attendance.device.password'),
-            protocol: (string) config('attendance.device.protocol', 'tcp'),
+            protocol: $protocol,
         );
     }
 

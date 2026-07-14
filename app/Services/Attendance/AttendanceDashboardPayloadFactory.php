@@ -34,11 +34,41 @@ class AttendanceDashboardPayloadFactory
     {
         $selectedDate = ($date ?? CarbonImmutable::now())->startOfDay();
 
-        $records = $this->timelineService->recordsOnDate($selectedDate);
+        return $this->makeRange($selectedDate, $selectedDate);
+    }
+
+    /**
+     * @return array{
+     *     totals: array{
+     *         selected_date: string,
+     *         from_date: string,
+     *         to_date: string,
+     *         total_check_ins: int,
+     *         total_check_outs: int,
+     *         total_records: int,
+     *         last_activity: ?string,
+     *         last_sync_at: ?string,
+     *         records: array<int, array<string, mixed>>
+     *     },
+     *     working_hours: array{start_time: string, end_time: string},
+     *     employees: array<int, array{device_user_id: string, name: string}>,
+     *     status: array{online: bool, device_time: ?string, firmware_version: ?string, error: ?string}
+     * }
+     */
+    public function makeRange(CarbonImmutable $fromDate, CarbonImmutable $toDate): array
+    {
+        $rangeStart = $fromDate->startOfDay();
+        $rangeEnd = $toDate->endOfDay();
+
+        $records = $rangeStart->isSameDay($rangeEnd)
+            ? $this->timelineService->recordsOnDate($rangeStart)
+            : $this->timelineService->recordsBetween($rangeStart, $rangeEnd);
 
         return [
             'totals' => [
-                'selected_date' => $selectedDate->toDateString(),
+                'selected_date' => $rangeStart->toDateString(),
+                'from_date' => $rangeStart->toDateString(),
+                'to_date' => $rangeEnd->toDateString(),
                 'total_check_ins' => $records->where('state', 'check_in')->count(),
                 'total_check_outs' => $records->where('state', 'check_out')->count(),
                 'total_records' => $records->count(),

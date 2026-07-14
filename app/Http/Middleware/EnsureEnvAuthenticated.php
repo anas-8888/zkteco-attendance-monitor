@@ -2,27 +2,54 @@
 
 namespace App\Http\Middleware;
 
-use App\Support\EnvCredentials;
+use App\Services\Initialization\ApplicationInitializationState;
 use Closure;
 use Illuminate\Http\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 class EnsureEnvAuthenticated
 {
+    public function __construct(
+        private readonly ApplicationInitializationState $initializationState,
+    ) {
+    }
+
     public function handle(Request $request, Closure $next): Response
     {
-        if ($request->routeIs('login.*')) {
+        if ($request->routeIs('installation.incomplete')) {
             return $next($request);
         }
 
-        $auth = $request->session()->get('env_auth');
+        if (! $this->initializationState->isInitialized()) {
+            if ($request->routeIs('login.*')) {
+                return $this->initializationState->canUseBrowserSetup()
+                    ? redirect()->route('setup.show')
+                    : redirect()->route('installation.incomplete');
+            }
 
-        if (
-            ! is_array($auth)
-            || ($auth['username'] ?? null) !== EnvCredentials::username()
-            || ! hash_equals((string) ($auth['signature'] ?? ''), EnvCredentials::signature())
-        ) {
-            $request->session()->forget('env_auth');
+            if ($request->routeIs('setup.*') && $this->initializationState->canUseBrowserSetup()) {
+                return $next($request);
+            }
+
+            if ($request->expectsJson()) {
+                return response()->json([
+                    'message' => $this->initializationState->status()['message'],
+                ], 503);
+            }
+
+            return $this->initializationState->canUseBrowserSetup()
+                ? redirect()->route('setup.show')
+                : redirect()->route('installation.incomplete');
+        }
+
+        if ($request->routeIs('login.*') || $request->routeIs('setup.*')) {
+            return $next($request);
+        }
+
+        $userId = $request->session()->get('auth_user_id');
+
+        if (! is_numeric($userId) || ! \App\Models\User::query()->whereKey($userId)->exists()) {
+            $request->session()->forget('auth_user_id');
 
             if ($request->expectsJson()) {
                 return response()->json([

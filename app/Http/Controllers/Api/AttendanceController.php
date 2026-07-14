@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Employee;
 use App\Services\Attendance\AttendanceDashboardPayloadFactory;
+use App\Services\Attendance\DeviceConnectionSettingsManager;
+use App\Services\Attendance\DefaultWorkingHoursManager;
 use App\Services\Attendance\AttendanceLogSynchronizer;
 use App\Services\Attendance\AttendanceRangeReportService;
 use App\Services\Attendance\AttendanceRangeSummaryService;
@@ -41,12 +43,19 @@ class AttendanceController extends Controller
 
     public function dashboard(Request $request, AttendanceLogSynchronizer $synchronizer): JsonResponse
     {
-        $selectedDate = $this->resolveRequestedDate($request);
-        if ($selectedDate->isToday()) {
-            $synchronizer->triggerBackgroundSyncIfDue();
+        [$fromDate, $toDate] = $this->resolveRequestedRange($request);
+
+        if ($this->rangeIncludesToday($fromDate, $toDate)) {
+            if ($request->boolean('force_sync')) {
+                $synchronizer->forceSync();
+            } elseif ($request->boolean('dispatch_sync')) {
+                $synchronizer->triggerBackgroundSync(force: true);
+            } else {
+                $synchronizer->triggerBackgroundSyncIfDue();
+            }
         }
 
-        $payload = $this->payloadFactory->make($selectedDate);
+        $payload = $this->payloadFactory->makeRange($fromDate, $toDate);
 
         return response()->json($payload, 200, [
             'Cache-Control' => 'no-store, no-cache, must-revalidate, max-age=0',
@@ -237,6 +246,56 @@ class AttendanceController extends Controller
         ]);
     }
 
+    public function updateDefaultWorkingHours(
+        Request $request,
+        DefaultWorkingHoursManager $defaultWorkingHoursManager,
+    ): JsonResponse {
+        $validated = $request->validate([
+            'work_start_time' => ['required', 'date_format:H:i'],
+            'work_end_time' => ['required', 'date_format:H:i'],
+            'off_days' => ['required', 'array', 'min:1'],
+            'off_days.*' => ['integer', 'between:0,6'],
+        ]);
+
+        if ($validated['work_end_time'] <= $validated['work_start_time']) {
+            return response()->json([
+                'message' => 'The work end time must be after the work start time.',
+                'errors' => [
+                    'work_end_time' => ['The work end time must be after the work start time.'],
+                ],
+            ], 422);
+        }
+
+        return response()->json([
+            'message' => 'Default working hours saved successfully.',
+            'working_hours' => $defaultWorkingHoursManager->update(
+                $validated['work_start_time'],
+                $validated['work_end_time'],
+                $validated['off_days'],
+            ),
+        ]);
+    }
+
+    public function updateDeviceSettings(
+        Request $request,
+        DeviceConnectionSettingsManager $deviceConnectionSettingsManager,
+    ): JsonResponse {
+        $validated = $request->validate([
+            'device_ip' => ['required', 'ip'],
+            'device_port' => ['required', 'integer', 'between:1,65535'],
+            'device_protocol' => ['required', 'in:tcp,udp,auto'],
+        ]);
+
+        return response()->json([
+            'message' => 'Device connection settings saved successfully.',
+            'device' => $deviceConnectionSettingsManager->update(
+                $validated['device_ip'],
+                (int) $validated['device_port'],
+                (string) $validated['device_protocol'],
+            ),
+        ]);
+    }
+
     private function resolveRequestedDate(Request $request): CarbonImmutable
     {
         $validated = $request->validate([
@@ -249,6 +308,39 @@ class AttendanceController extends Controller
 
         return CarbonImmutable::createFromFormat('Y-m-d', $validated['date'], config('app.timezone'))
             ->startOfDay();
+    }
+
+    /**
+     * @return array{0: CarbonImmutable, 1: CarbonImmutable}
+     */
+    private function resolveRequestedRange(Request $request): array
+    {
+        $fromDate = trim((string) $request->query('from_date', ''));
+        $toDate = trim((string) $request->query('to_date', ''));
+
+        if ($fromDate !== '' || $toDate !== '') {
+            $validated = $request->validate([
+                'from_date' => ['required', 'date_format:Y-m-d'],
+                'to_date' => ['required', 'date_format:Y-m-d', 'after_or_equal:from_date'],
+            ]);
+
+            return [
+                CarbonImmutable::createFromFormat('Y-m-d', $validated['from_date'], config('app.timezone'))->startOfDay(),
+                CarbonImmutable::createFromFormat('Y-m-d', $validated['to_date'], config('app.timezone'))->startOfDay(),
+            ];
+        }
+
+        $selectedDate = $this->resolveRequestedDate($request);
+
+        return [$selectedDate, $selectedDate];
+    }
+
+    private function rangeIncludesToday(CarbonImmutable $fromDate, CarbonImmutable $toDate): bool
+    {
+        $today = CarbonImmutable::now(config('app.timezone'))->startOfDay();
+
+        return $today->greaterThanOrEqualTo($fromDate->startOfDay())
+            && $today->lessThanOrEqualTo($toDate->startOfDay());
     }
 
     private function resolveRequestedMonth(Request $request): CarbonImmutable

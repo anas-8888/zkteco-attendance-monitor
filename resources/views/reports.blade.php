@@ -8,29 +8,30 @@
         @vite(['resources/css/app.css', 'resources/js/reports.js'])
     </head>
     <body class="bg-slate-50 text-slate-900 antialiased">
-        <main class="min-h-screen" data-reports-page>
+        <main class="min-h-screen" data-reports-page data-selected-employee-id="{{ $selectedEmployeeId ?? '' }}">
             <section class="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:px-8">
                 @include('partials.app-navigation')
 
                 <header class="flex flex-col gap-3 border-b border-slate-200 pb-6">
                     <div>
                         <p class="text-sm font-medium text-slate-500">Attendance Reports</p>
-                        <h1 class="mt-1 text-2xl font-semibold text-slate-950">Employee Attendance Report</h1>
+                        <h1 class="mt-1 text-2xl font-semibold text-slate-950">Attendance Report</h1>
                     </div>
                     <p class="max-w-3xl text-sm leading-6 text-slate-600">
-                        Select an employee and a date range to review attendance sessions and total attendance duration.
+                        Review all employees attendance or focus on one employee for a selected date range, including sessions, raw punches, and late arrivals.
                     </p>
                 </header>
 
                 <section class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
-                    <form class="grid gap-4 md:grid-cols-2 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)_auto]" data-report-form>
+                    <form class="grid gap-4 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1fr)_auto]" data-report-form>
                         <label class="block">
                             <span class="form-label">Employee</span>
                             <select class="form-input w-full" data-report-user>
-                                <option value="">Choose an employee</option>
+                                <option value="">All employees</option>
                                 @foreach ($employees as $employee)
                                     <option
                                         value="{{ $employee->device_user_id }}"
+                                        {{ ($selectedEmployeeId ?? '') === $employee->device_user_id ? 'selected' : '' }}
                                         data-work-start="{{ $employee->work_start_time ?: config('attendance.schedule.start_time') }}"
                                         data-work-end="{{ $employee->work_end_time ?: config('attendance.schedule.end_time') }}"
                                         data-has-custom-hours="{{ $employee->work_start_time && $employee->work_end_time ? 'true' : 'false' }}"
@@ -42,13 +43,13 @@
                         </label>
 
                         <label class="block">
-                            <span class="form-label">From Date</span>
-                            <input type="date" class="form-input w-full" data-report-from>
+                            <span class="form-label">From</span>
+                            <input type="date" class="form-input w-full" data-report-from-date>
                         </label>
 
                         <label class="block">
-                            <span class="form-label">To Date</span>
-                            <input type="date" class="form-input w-full" data-report-to>
+                            <span class="form-label">To</span>
+                            <input type="date" class="form-input w-full" data-report-to-date>
                         </label>
 
                         <div class="flex items-end">
@@ -59,16 +60,25 @@
                     </form>
 
                     <div class="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 pt-4">
-                        <p class="text-sm text-slate-600" data-working-hours-summary>
-                            Default working hours: {{ config('attendance.schedule.start_time') }} - {{ config('attendance.schedule.end_time') }}
-                        </p>
-                        <button
-                            type="button"
-                            class="btn-secondary w-full sm:w-auto"
-                            data-working-hours-open
-                        >
-                            Customize Employee Hours
-                        </button>
+                        <div>
+                            <p class="text-sm text-slate-600" data-working-hours-summary>
+                                @if ($selectedEmployee)
+                                    Viewing {{ $selectedEmployee->name }} ({{ $selectedEmployee->device_user_id }}) with default working hours {{ config('attendance.schedule.start_time') }} - {{ config('attendance.schedule.end_time') }}
+                                @else
+                                    Viewing all employees with default working hours {{ config('attendance.schedule.start_time') }} - {{ config('attendance.schedule.end_time') }}
+                                @endif
+                            </p>
+                            <p class="mt-1 text-xs text-slate-500">Default work hours are changed from Settings. Custom employee hours apply when one employee is selected.</p>
+                        </div>
+                        <div class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+                            <button
+                                type="button"
+                                class="btn-secondary w-full sm:w-auto"
+                                data-working-hours-open
+                            >
+                                Customize Employee Hours
+                            </button>
+                        </div>
                     </div>
                 </section>
 

@@ -1,6 +1,9 @@
 <?php
 
 use App\Console\Commands\AttendanceSyncCommand;
+use App\Console\Commands\AttendanceReconcileCommand;
+use App\Console\Commands\ApplicationInitializationStatusCommand;
+use App\Console\Commands\InitializeApplicationCommand;
 use App\Http\Middleware\EnsureEnvAuthenticated;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
@@ -15,6 +18,9 @@ return Application::configure(basePath: dirname(__DIR__))
     )
     ->withCommands([
         AttendanceSyncCommand::class,
+        AttendanceReconcileCommand::class,
+        InitializeApplicationCommand::class,
+        ApplicationInitializationStatusCommand::class,
     ])
     ->withMiddleware(function (Middleware $middleware): void {
         $middleware->web(append: [

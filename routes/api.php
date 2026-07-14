@@ -11,6 +11,8 @@ Route::middleware('web')->group(function (): void {
     Route::get('/attendance/report', [AttendanceController::class, 'report']);
     Route::get('/attendance/summary', [AttendanceController::class, 'summary']);
     Route::get('/attendance/today', [AttendanceController::class, 'today']);
+    Route::post('/attendance/default-working-hours', [AttendanceController::class, 'updateDefaultWorkingHours']);
+    Route::post('/attendance/device-settings', [AttendanceController::class, 'updateDeviceSettings']);
     Route::post('/employees/{deviceUserId}/working-hours', [AttendanceController::class, 'updateEmployeeWorkingHours']);
     Route::post('/attendance/manual-check-in', [AttendanceController::class, 'manualCheckIn']);
     Route::post('/attendance/manual-check-out', [AttendanceController::class, 'manualCheckOut']);

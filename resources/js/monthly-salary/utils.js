@@ -175,6 +175,7 @@ export const formatTime = (timeValue) => {
     return new Intl.DateTimeFormat(ENGLISH_LOCALE, {
         hour: 'numeric',
         minute: '2-digit',
+        hour12: true,
     }).format(date);
 };
 

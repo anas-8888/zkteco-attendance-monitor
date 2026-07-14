@@ -3,15 +3,23 @@
 namespace App\Http\Controllers\Auth;
 
 use App\Http\Controllers\Controller;
-use App\Support\EnvCredentials;
+use App\Models\User;
+use App\Services\Initialization\ApplicationInitializationState;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\View\View;
 
 class LoginController extends Controller
 {
-    public function show(Request $request): View|RedirectResponse
+    public function show(Request $request, ApplicationInitializationState $initializationState): View|RedirectResponse
     {
+        if (! $initializationState->isInitialized()) {
+            return $initializationState->canUseBrowserSetup()
+                ? redirect()->route('setup.show')
+                : redirect()->route('installation.incomplete');
+        }
+
         if ($this->isAuthenticated($request)) {
             return redirect()->route('dashboard');
         }
@@ -19,19 +27,24 @@ class LoginController extends Controller
         return view('auth.login');
     }
 
-    public function store(Request $request): RedirectResponse
+    public function store(Request $request, ApplicationInitializationState $initializationState): RedirectResponse
     {
+        if (! $initializationState->isInitialized()) {
+            return $initializationState->canUseBrowserSetup()
+                ? redirect()->route('setup.show')
+                : redirect()->route('installation.incomplete');
+        }
+
         $validated = $request->validate([
             'username' => ['required', 'string'],
             'password' => ['required', 'string'],
         ]);
 
-        $expectedUsername = EnvCredentials::username();
-        $expectedPassword = EnvCredentials::password();
+        $user = User::query()->firstWhere('name', trim((string) $validated['username']));
 
         if (
-            ! hash_equals($expectedUsername, (string) $validated['username'])
-            || ! hash_equals($expectedPassword, (string) $validated['password'])
+            ! $user instanceof User
+            || ! Hash::check((string) $validated['password'], $user->password)
         ) {
             return back()
                 ->withInput($request->only('username'))
@@ -42,10 +55,7 @@ class LoginController extends Controller
 
         $request->session()->invalidate();
         $request->session()->regenerateToken();
-        $request->session()->put('env_auth', [
-            'username' => $expectedUsername,
-            'signature' => EnvCredentials::signature(),
-        ]);
+        $request->session()->put('auth_user_id', $user->id);
         $request->session()->regenerate();
 
         return redirect()->route('dashboard');
@@ -53,7 +63,7 @@ class LoginController extends Controller
 
     public function destroy(Request $request): RedirectResponse
     {
-        $request->session()->forget('env_auth');
+        $request->session()->forget('auth_user_id');
         $request->session()->invalidate();
         $request->session()->regenerateToken();
 
@@ -62,10 +72,8 @@ class LoginController extends Controller
 
     private function isAuthenticated(Request $request): bool
     {
-        $auth = $request->session()->get('env_auth');
+        $userId = $request->session()->get('auth_user_id');
 
-        return is_array($auth)
-            && ($auth['username'] ?? null) === EnvCredentials::username()
-            && hash_equals((string) ($auth['signature'] ?? ''), EnvCredentials::signature());
+        return is_numeric($userId) && User::query()->whereKey($userId)->exists();
     }
 }

@@ -25,12 +25,18 @@
             >
                 Reports
             </a>
-            <span
-                aria-disabled="true"
-                class="inline-flex h-9 cursor-not-allowed items-center rounded-md border border-slate-200 bg-slate-100 px-3 text-sm font-medium text-slate-400 opacity-80"
+            <a
+                href="{{ route('employees') }}"
+                class="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium transition {{ request()->routeIs('employees') ? 'border-slate-950 bg-slate-950 text-white' : 'border-slate-200 text-slate-700 hover:bg-slate-50' }}"
             >
-                Payroll & Statistics
-            </span>
+                Employees
+            </a>
+            <a
+                href="{{ route('settings') }}"
+                class="inline-flex h-9 items-center rounded-md border px-3 text-sm font-medium transition {{ request()->routeIs('settings') ? 'border-slate-950 bg-slate-950 text-white' : 'border-slate-200 text-slate-700 hover:bg-slate-50' }}"
+            >
+                Settings
+            </a>
             <form method="POST" action="{{ route('login.destroy') }}">
                 @csrf
                 <button
